@@ -87,30 +87,8 @@ FGM 在 embedding 上加扰动，适用于**分类边界清晰**的场景。本�
 
 ## 4. 最优配置
 
-```yaml
-# configs/roberta_supcon_focal.yaml
-model_name: hfl/chinese-roberta-wwm-ext
-max_length: 192
-batch_size: 16
-gradient_accumulation_steps: 1
-
-learning_rate: 3.0e-05
-epochs: 12
-warmup_ratio: 0.1
-weight_decay: 0.01
-dropout: 0.2
-
-classification_loss: focal       # 核心改动
-focal_gamma: 2.0
-
-contrastive_loss: supervised_contrastive
-contrastive_dim: 64              # 128→64，小数据降维
-temperature: 0.07
-lambda_contrast: 0.1
-
-validation_split: 0.2
-early_stopping_patience: 5
-seed: 42
+```bash
+python src/train.py --config configs/roberta_supcon_focal.yaml 
 ```
 
 ## 5. 后续方向
