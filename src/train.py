@@ -5,11 +5,12 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -26,9 +27,9 @@ from src.data import (  # noqa: E402
     split_train_valid,
     summarize_dataframe,
 )
-from src.losses import SupConLoss  # noqa: E402
+from src.losses import FocalLoss, ProtoSupConLoss, SupConLoss  # noqa: E402
 from src.model import RobertaSupConClassifier  # noqa: E402
-from src.utils import compute_metrics, ensure_dir, load_config, save_json, set_seed  # noqa: E402
+from src.utils import FGM, compute_metrics, ensure_dir, load_config, save_json, set_seed  # noqa: E402
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -114,13 +115,31 @@ def train(config_path: str):
     valid_dataset = TextClassificationDataset(split.valid_df, tokenizer, int(cfg["max_length"]), has_labels=True)
     test_dataset = TextClassificationDataset(test_df, tokenizer, int(cfg["max_length"]), has_labels=True)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg["batch_size"]),
-        shuffle=True,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available(),
-    )
+    # ---- 平衡采样（小样本 / 长尾场景推荐开启） ----
+    if bool(cfg.get("balance_sampling", False)):
+        train_labels = split.train_df["label_id"].astype(int).values
+        class_counts = np.bincount(train_labels)
+        sample_weights = 1.0 / class_counts[train_labels]
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_weights).float(),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg["batch_size"]),
+            sampler=sampler,
+            num_workers=0,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(cfg["batch_size"]),
+            shuffle=True,
+            num_workers=0,
+            pin_memory=torch.cuda.is_available(),
+        )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=int(cfg["eval_batch_size"]),
@@ -147,8 +166,24 @@ def train(config_path: str):
         location_priority_embedding_dim=int(cfg.get("location_priority_embedding_dim", 8)),
     ).to(device)
 
-    ce_loss_fn = nn.CrossEntropyLoss()
-    supcon_loss_fn = SupConLoss(temperature=float(cfg["temperature"]))
+    cls_loss_type = str(cfg.get("classification_loss", "cross_entropy"))
+    if cls_loss_type == "focal":
+        ce_loss_fn = FocalLoss(
+            gamma=float(cfg.get("focal_gamma", 2.0)),
+            alpha=cfg.get("focal_alpha", None),
+        )
+    else:
+        ce_loss_fn = nn.CrossEntropyLoss()
+    contrastive_loss_type = str(cfg.get("contrastive_loss", "supervised_contrastive"))
+    if contrastive_loss_type == "proto_supervised_contrastive":
+        supcon_loss_fn = ProtoSupConLoss(
+            num_classes=len(label_names),
+            feat_dim=int(cfg["contrastive_dim"]),
+            temperature=float(cfg["temperature"]),
+            alpha=float(cfg.get("proto_alpha", 0.5)),
+        )
+    else:
+        supcon_loss_fn = SupConLoss(temperature=float(cfg["temperature"]))
     optimizer = AdamW(model.parameters(), lr=float(cfg["learning_rate"]), weight_decay=float(cfg["weight_decay"]))
 
     gradient_accumulation_steps = int(cfg["gradient_accumulation_steps"])
@@ -169,9 +204,21 @@ def train(config_path: str):
     history = []
     lambda_contrast = float(cfg["lambda_contrast"])
 
+    use_fgm = bool(cfg.get("use_fgm", False))
+    fgm_epsilon = float(cfg.get("fgm_epsilon", 0.5))
+    fgm = FGM(model, epsilon=fgm_epsilon) if use_fgm else None
+
     print(f"device={device}")
     print(f"split_method={split.split_method}, train={len(split.train_df)}, valid={len(split.valid_df)}, test={len(test_df)}")
     print(f"labels={label_names}")
+    print(f"classification_loss={cls_loss_type}, contrastive_loss={contrastive_loss_type}")
+    print(f"temperature={cfg['temperature']}, lambda_contrast={lambda_contrast}")
+    if contrastive_loss_type == "proto_supervised_contrastive":
+        print(f"proto_alpha={cfg.get('proto_alpha', 0.5)}")
+    if bool(cfg.get("balance_sampling", False)):
+        print("balance_sampling=True")
+    if use_fgm:
+        print(f"fgm=True, fgm_epsilon={fgm_epsilon}")
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
@@ -196,6 +243,21 @@ def train(config_path: str):
             contrast_loss, valid_anchors = supcon_loss_fn(outputs["contrastive_embedding"], labels)
             loss = cls_loss + lambda_contrast * contrast_loss
             (loss / gradient_accumulation_steps).backward()
+
+            # FGM 对抗训练：在 embedding 上沿梯度方向加扰动后重算 loss
+            if use_fgm:
+                fgm.attack()
+                outputs_adv = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    token_type_ids=batch.get("token_type_ids"),
+                    location_priority_ids=batch.get("location_priority_ids"),
+                )
+                cls_loss_adv = ce_loss_fn(outputs_adv["logits"], labels)
+                contrast_loss_adv, _ = supcon_loss_fn(outputs_adv["contrastive_embedding"], labels)
+                loss_adv = cls_loss_adv + lambda_contrast * contrast_loss_adv
+                (loss_adv / gradient_accumulation_steps).backward()
+                fgm.restore()
 
             if step % gradient_accumulation_steps == 0 or step == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["max_grad_norm"]))
